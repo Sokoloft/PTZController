@@ -38,7 +38,7 @@ Print the application version without starting the GUI/server:
 python src/main.py --version
 ```
 
-The initial application version is 0.1.0, defined in `ptz_controller.__version__`. See
+The initial application version is 1.0.0, defined in `ptz_controller.__version__`. See
 [PACKAGING.md](docs/PACKAGING.md) for the standalone AppImage release workflow
 and persistent-configuration behavior.
 
