@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=PTZ Controller
+GenericName=PTZ Camera Controller
+Comment=Control VISCA PTZ cameras with a gamepad
+Exec="@APPIMAGE@" --config "@CONFIG@"
+Icon=ptz-controller
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=PTZ;VISCA;Camera;Gamepad;
+StartupNotify=true

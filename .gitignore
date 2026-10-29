@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+/config.json
+/config.tmp
+/src/config.json
+/src/config.tmp
+/tests/
+/.venv-build/
+/*.AppImage
+/*.AppImage.part
+/AppDir/
+/dist/
+/build/
+/PTZ_Controller.spec

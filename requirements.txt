@@ -1,0 +1,4 @@
+Flask>=3.1,<4
+pywebview[qt]>=5.4,<7
+pygame-ce>=2.5,<3
+visca-over-ip==0.5.1

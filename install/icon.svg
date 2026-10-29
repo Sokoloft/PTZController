@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>PTZ Controller</title>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="#252525"/>
+  <path d="M80 62h96c24 0 37 18 43 44l15 67c5 23-18 37-34 22l-28-27H84l-28 27c-16 15-39 1-34-22l15-67c6-26 19-44 43-44Z" fill="#d7d7d7" stroke="#f1f1f1" stroke-width="5" stroke-linejoin="round"/>
+  <path d="M60 88h16v17h17v16H76v17H60v-17H43v-16h17Z" fill="#303030"/>
+  <g fill="#303030"><circle cx="192" cy="92" r="8"/><circle cx="212" cy="112" r="8"/><circle cx="192" cy="132" r="8"/><circle cx="172" cy="112" r="8"/></g>
+  <g fill="#4b4b4b" stroke="#303030" stroke-width="3"><circle cx="99" cy="148" r="13"/><circle cx="153" cy="148" r="13"/></g>
+  <!-- PTZ as vector lettering so the icon does not depend on installed fonts. -->
+  <g fill="none" stroke="#303030" stroke-width="6" stroke-linecap="square" stroke-linejoin="round" transform="translate(-4 0)">
+    <path d="M102 114V90h7q9 0 9 7t-9 7h-7"/>
+    <path d="M126 90h16m-8 0v24"/>
+    <path d="M148 90h15l-15 24h15"/>
+  </g>
+</svg>
