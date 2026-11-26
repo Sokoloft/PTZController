@@ -123,17 +123,12 @@ checks and an offscreen Qt startup check using a temporary configuration. These
 checks used extraction mode because FUSE is unavailable in the build environment.
 Testing on clean target distributions and with camera hardware remains necessary.
 
-Direct launches default to `config.json` beside `src/main.py`, the AppImage, or a
-plain frozen executable. This path is independent of the working directory. Use
-`--config PATH` to choose another file; the desktop launcher uses this to store
-settings under the user's .config directory. There is no PTZ_CONFIG environment
-override. Moving the app and an app-local config.json together carries settings;
-updating only the AppImage in the same folder preserves them.
-
-If the default local file is absent, settings from the former
-`~/.config/ptz-controller/config.json` location are copied once, preserving the
-original. Explicit --config paths are used directly. Camera position presets remain
-in camera memory; the virtual camera's position presets are temporary.
+Direct launches discover named JSON presets in `~/.config/ptz-controller` or
+`$XDG_CONFIG_HOME/ptz-controller`. The desktop launcher passes
+`--config PATH` to select the directory containing that path. An older aggregate
+config in that directory is migrated into individual preset files, with the
+original preserved. Camera position presets remain in camera memory. The virtual
+camera's position presets are temporary.
 
 ## References
 

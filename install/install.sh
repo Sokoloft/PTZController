@@ -29,6 +29,8 @@ config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ptz-controller"
 icon_dir="$data_dir/icons/hicolor/scalable/apps"
 applications_dir="$data_dir/applications"
 app_path="$bin_dir/ptz-controller.AppImage"
+# Keep the legacy launcher argument so both older releases and the preset-based
+# app resolve settings in this directory.
 config_path="$config_dir/config.json"
 for path in "$app_path" "$config_path" "$data_dir"; do
     [[ $path == /* ]] || fail 'HOME and XDG directory paths must be absolute.'
@@ -95,4 +97,4 @@ fi
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -f -t "$data_dir/icons/hicolor" >/dev/null 2>&1 || true
 fi
-printf 'Installed: %s\nLauncher config: %s\nLaunch PTZ Controller from your application menu.\n' "$app_path" "$config_path"
+printf 'Installed: %s\nPreset directory: %s\nLaunch PTZ Controller from your application menu.\n' "$app_path" "$config_dir"

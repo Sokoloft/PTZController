@@ -1,90 +1,97 @@
-"""visca-over-ip 0.5.1 adapter.
+"""Serialized UDP commands with bounded, coalesced motion queues.
 
-Only this module depends on the package's private hooks, for logging and custom
-commands. Public Camera methods perform movement and supported named actions.
-All blocking Camera operations run on one worker; input polling never waits for UDP.
+Send validated VISCA bytes unchanged, including legal nonzero stop speeds.
+Worker logs are drained by the engine; network waits never hold its lock.
 """
 from collections import deque
 from queue import Empty, SimpleQueue
+import socket
+import struct
 import threading
-from visca_over_ip import Camera
-from .visca import pantilt, lens
+import time
+from .visca import pantilt, lens, frame
 
 
-class LoggedCamera(Camera):
-    def __init__(self, host, port, emit):
-        self.emit = emit
+class WireCamera:
+    def __init__(self, settings, emit):
+        self.settings, self.emit = settings, emit
         self.received = False
+        self.sequence = 0
+        self.last_send = 0.
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            super().__init__(host, port)
-            # Avoid repeating non-idempotent commands when a camera returns errors.
-            self.num_retries = 1
+            self.sock.connect((settings['host'], settings['port']))
+            if settings['framing'] == 'sony':
+                self.reset_sequence_number()
         except Exception:
-            if hasattr(self, '_sock'):
-                self.close_connection()
+            self.sock.close()
             raise
 
-    def _send_command(self, command_hex, query=False):
-        self.emit('TX', ('81 09 ' if query else '81 01 ') +
-                  bytes.fromhex(command_hex).hex(' ') + ' ff [visca_over_ip]')
-        return super()._send_command(command_hex, query=query)
+    def _exchange(self, wire, sequence=None, reset=False, payload=None):
+        # Leave at least one video cycle between commands, even with instant ACKs.
+        time.sleep(max(0, .05 - (time.monotonic() - self.last_send)))
+        self.sock.send(wire)
+        self.last_send = time.monotonic()
+        self.emit('TX', wire.hex(' '))
+        deadline = time.monotonic() + .3
+        while time.monotonic() < deadline:
+            self.sock.settimeout(max(.001, deadline - time.monotonic()))
+            try:
+                data = self.sock.recv(4096)
+            except socket.timeout:
+                break
+            if self.settings['framing'] == 'sony':
+                if len(data) < 8:
+                    continue
+                kind, size, reply_sequence = struct.unpack('!HHI', data[:8])
+                if len(data) != 8 + size or reply_sequence != sequence:
+                    continue
+                data = data[8:]
+                if reset:
+                    if kind == 0x0201 and data == b'\x01':
+                        return
+                    continue
+                if kind == 0x0201:
+                    self.emit('ERROR', 'VISCA network error: ' + data.hex(' ') + '; try sequence reset')
+                    return
+                if kind != 0x0111:
+                    continue
+            for reply in data.split(b'\xff')[:-1]:
+                if len(reply) < 2 or reply[0] != (self.settings['address'] + 8) << 4:
+                    continue
+                self.received = True
+                self.emit('RX', (reply + b'\xff').hex(' '))
+                status = reply[1] & 0xf0
+                if status == 0x60:
+                    reason = {1: 'message length error', 2: 'syntax error / unsupported command',
+                              3: 'command buffer full', 4: 'command canceled',
+                              5: 'no socket', 0x41: 'command not executable'}.get(
+                                  reply[2] if len(reply) > 2 else 0, 'unknown error')
+                    self.emit('ERROR', f'Camera rejected {payload.hex(" ")}: {reason} '
+                              f'({(reply + bytes([255])).hex(" ")})')
+                    return
+                if status == 0x40 and payload[1] != 9:
+                    return
+                if status == 0x50:
+                    # Raw UDP has no sequence; discard delayed socket completions.
+                    if self.settings['framing'] == 'sony' or reply[1] == 0x50:
+                        return
+        self.emit('WARN', 'No matching camera reply for ' + wire.hex(' ') +
+                  '; command was not retried')
 
-    def _receive_response(self):
-        try:
-            result = super()._receive_response()
-        except Exception as exc:
-            self.emit('ERROR', str(exc))
-            raise
-        if result is not None:
-            self.received = True
-            self.emit('RX', result.hex(' '))
-        else:
-            self.emit('WARN', 'No camera reply (visca_over_ip timeout)')
-        return result
+    def send_payload(self, payload):
+        sony = self.settings['framing'] == 'sony'
+        sequence = self.sequence
+        wire = frame(payload, sequence, payload[1] == 9) if sony else payload
+        self.sequence = (sequence + 1) & 0xffffffff
+        self._exchange(wire, sequence, payload=payload)
 
     def reset_sequence_number(self):
-        self.emit('INFO', 'visca_over_ip: resetting camera sequence')
-        return super().reset_sequence_number()
+        self._exchange(bytes.fromhex('02 00 00 01 00 00 00 00 01'), 0, reset=True)
+        self.sequence = 0
 
-
-def dispatch(camera, payload):
-    """Translate validated app payloads to the package's public Camera API."""
-    body = payload[2:-1]
-    if payload[1] == 1 and len(body) == 6 and body[:2] == b'\x06\x01':
-        pan = body[2] * (-1 if body[4] == 1 else 1) if body[4] != 3 else 0
-        tilt = body[3] * (-1 if body[5] == 1 else 1) if body[5] != 3 else 0
-        return camera.pantilt(pan, tilt)
-    if payload[1] == 1 and len(body) == 3 and body[:2] in (b'\x04\x07', b'\x04\x08'):
-        code = body[2]
-        speed = (code & 15) * (1 if code & 0xf0 == 0x20 else -1) if code else 0
-        if body[1] == 7:
-            return camera.zoom(speed)
-        # In this library positive manual_focus is near (0x3p).
-        return camera.manual_focus(-speed)
-    if payload[1] == 1 and len(body) == 4 and body[:2] == b'\x04\x3f' and body[2] in (1, 2):
-        method = camera.save_preset if body[2] == 1 else camera.recall_preset
-        return method(body[3])
-    named = {
-        b'\x06\x04': ('pantilt_home', ()),
-        b'\x04\x38\x02': ('set_focus_mode', ('auto',)),
-        b'\x04\x38\x03': ('set_focus_mode', ('manual',)),
-        b'\x04\x00\x02': ('set_power', (True,)),
-        b'\x04\x00\x03': ('set_power', (False,)),
-        b'\x04\x39\x00': ('autoexposure_mode', ('auto',)),
-        b'\x04\x39\x03': ('autoexposure_mode', ('manual',)),
-        b'\x04\x35\x00': ('white_balance_mode', ('auto',)),
-        b'\x04\x35\x03': ('white_balance_mode', ('one push',)),
-        b'\x04\x33\x02': ('backlight', (True,)),
-        b'\x04\x33\x03': ('backlight', (False,)),
-    }
-    for code, name in ((0x0a, 'shutter'), (0x0b, 'iris'), (0x0c, 'gain')):
-        named[bytes([4, code, 2])] = ('increase_' + name, ())
-        named[bytes([4, code, 3])] = ('decrease_' + name, ())
-    if payload[1] == 1 and body in named:
-        method, args = named[body]
-        return getattr(camera, method)(*args)
-    # The package has no public generic command API (including preset clear).
-    return camera._send_command(body.hex(' '), query=payload[1] == 9)
+    def close_connection(self):
+        self.sock.close()
 
 
 def motion_group(payload):
@@ -96,17 +103,18 @@ def motion_group(payload):
 
 
 class PackageTransport:
-    backend = 'visca_over_ip 0.5.1 · Sony UDP'
+    backend = 'Queued VISCA UDP'
 
     def __init__(self, settings, log):
         self.settings, self.log = settings, log
+        self.backend += ' · Sony' if settings['framing'] == 'sony' else ' · Raw'
         self.error = ''
         self.events = SimpleQueue()
         self.condition = threading.Condition()
         self.pending = deque()
         self.closing = False
         self.camera = None
-        self.worker = threading.Thread(target=self._run, daemon=True, name='visca-over-ip')
+        self.worker = threading.Thread(target=self._run, daemon=True, name='visca-udp')
         self.worker.start()
 
     @property
@@ -158,7 +166,7 @@ class PackageTransport:
         def emit(kind, message):
             self.events.put((kind, message))
         try:
-            self.camera = LoggedCamera(self.settings['host'], self.settings['port'], emit)
+            self.camera = WireCamera(self.settings, emit)
             while True:
                 with self.condition:
                     self.condition.wait_for(lambda: self.pending or self.closing)
@@ -170,13 +178,15 @@ class PackageTransport:
                         self.camera.reset_sequence_number()
                     elif kind == 'stop':
                         # Try every stop even if one axis is rejected by the camera.
-                        for data in (pantilt(0, 0), lens('zoom', 0), lens('focus', 0)):
+                        address = self.settings['address']
+                        for data in (pantilt(0, 0, address), lens('zoom', 0, address),
+                                     lens('focus', 0, address)):
                             try:
-                                dispatch(self.camera, data)
+                                self.camera.send_payload(data)
                             except Exception as exc:
                                 emit('ERROR', f'Stop failed: {exc}')
                     else:
-                        dispatch(self.camera, payload)
+                        self.camera.send_payload(payload)
                 except Exception as exc:
                     self.error = str(exc)
                     emit('ERROR', self.error)

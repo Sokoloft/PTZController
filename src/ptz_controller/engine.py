@@ -9,21 +9,27 @@ import time
 from collections import deque
 from .visca import ACTIONS, CONTINUOUS, open_transport, command, pantilt, lens
 from .controllers import ControllerReader
-from .config import default_config_path, legacy_config_path
+from .config import default_config_path, preset_path, write_json
 
 
 def defaults():
     return {'camera': {'mode': 'simulator', 'host': '127.0.0.1', 'port': 52381,
                        'framing': 'sony', 'address': 1},
             'controller': 'virtual', 'speed': .5,
-            'axes': [{'index': 0, 'target': 'pan', 'deadzone': .15, 'invert': False},
-                     {'index': 1, 'target': 'tilt', 'deadzone': .15, 'invert': False},
-                     {'index': 3, 'target': 'zoom', 'deadzone': .15, 'invert': True}],
+            'axes': [{'index': 0, 'target': 'pan', 'deadzone': .15, 'response': 3, 'invert': False},
+                     {'index': 1, 'target': 'tilt', 'deadzone': .15, 'response': 3, 'invert': False},
+                     {'index': 3, 'target': 'zoom', 'deadzone': .15, 'response': 3, 'invert': True}],
             'bindings': []}
 
 
 def deadzone(value, zone):
     return 0 if abs(value) <= zone else math.copysign((abs(value)-zone)/(1-zone), value)
+
+
+def analog_response(value, zone, response=3):
+    """Rescale the deadzone, then soften stick travel without changing its range."""
+    value = deadzone(max(-1, min(1, value)), zone)
+    return math.copysign(abs(value) ** response, value)
 
 
 def validate(config):
@@ -43,9 +49,14 @@ def validate(config):
         raise ValueError('Speed must be greater than zero and at most 1')
     if not isinstance(c['controller'], str):
         raise ValueError('Invalid controller')
+    if not isinstance(c['axes'], list) or not isinstance(c['bindings'], list):
+        raise ValueError('Axes and button mappings must be lists')
     used = set()
     for axis in c['axes']:
         axis['index'], axis['deadzone'] = int(axis['index']), float(axis['deadzone'])
+        axis['response'] = float(axis.get('response', 3))
+        if axis['response'] not in (1, 2, 3):
+            raise ValueError('Axis response must be 1 (linear), 2 (gentle), or 3 (precision)')
         if axis['target'] not in ('pan', 'tilt', 'zoom', 'focus') or axis['target'] in used:
             raise ValueError('Map each motion target to at most one axis')
         used.add(axis['target'])
@@ -54,6 +65,8 @@ def validate(config):
     sources = set()
     for binding in c['bindings']:
         source = binding['source']
+        if not isinstance(source, str):
+            raise ValueError('Invalid button or D-pad source')
         parts = source.split(':')
         valid = len(parts) == 2 and parts[0] == 'button' and parts[1].isdigit()
         valid |= len(parts) == 3 and parts[0] == 'hat' and parts[1].isdigit() and parts[2] in ('up', 'down', 'left', 'right')
@@ -63,13 +76,28 @@ def validate(config):
         action = binding['action']
         if action not in ACTIONS:
             raise ValueError('Unknown mapped action')
-        if action not in CONTINUOUS | {'none', 'stop'}:
+        if action == 'profile_connect':
+            target = binding.get('param')
+            if not isinstance(target, str) or not target.strip():
+                raise ValueError('Select a saved application profile for the mapping')
+        elif action not in CONTINUOUS | {'none', 'stop'}:
             command(action, binding.get('param', 0), cam['address'])
     return c
 
 
+def read_preset(path):
+    try:
+        return validate(json.loads(path.read_text(encoding='utf-8')))
+    except (KeyError, TypeError, OverflowError, RecursionError) as exc:
+        raise ValueError('Invalid preset file') from exc
+
+
 class Engine:
-    def __init__(self, path=None):
+    def __init__(self, path=None, *, native_window=False):
+        # The desktop window lifetime is owned by cli.main, which stops the
+        # engine on exit. Physical input must not depend on Chromium timers
+        # that can be suspended when that window is minimized.
+        self.native_window = native_window
         self.lock = threading.RLock()
         self.updates = threading.Condition(self.lock)
         self.sample_sequence = 0
@@ -77,35 +105,16 @@ class Engine:
         self.generation = 0
         self.last_command_time = 0.
         self.path = Path(path).expanduser() if path is not None else default_config_path()
+        self.config_dir = self.path.parent
+        self._selection_path = self.config_dir/'.active-preset'
         self.logs = deque(maxlen=150)
         self.traffic = deque(maxlen=150)
         self.log_sequence = 0
         self.config = defaults()
         self.presets = {}
         self.active_preset = None
-        source = self.path
-        migrate = False
-        if path is None and not source.exists():
-            legacy = legacy_config_path()
-            if legacy != source and legacy.is_file():
-                source, migrate = legacy, True
-        try:
-            saved = json.loads(source.read_text())
-            if 'config' in saved:
-                self.config = validate(saved['config'])
-                self.presets = {name: validate(config) for name, config in saved.get('presets', {}).items()}
-                self.active_preset = saved.get('active_preset')
-                if self.active_preset not in self.presets:
-                    self.active_preset = None
-            else:
-                self.config = validate(saved)  # migrate existing single-configuration files
-            if migrate:
-                self._persist(self.config, self.presets, self.active_preset)
-                self.log('INFO', f'Migrated saved settings to {self.path}; original file preserved')
-        except FileNotFoundError:
-            pass
-        except (ValueError, KeyError, TypeError) as exc:
-            self.log('ERROR', f'Invalid saved configuration; using defaults: {exc}')
+        self.profile_generation = 0
+        self._restore_presets()
         self.transport = None
         self.devices = []
         self.input = {'axes': [], 'pressed': []}
@@ -129,58 +138,154 @@ class Engine:
             (self.traffic if kind in ('TX', 'RX') else self.logs).append(event)
 
     def save(self, config):
+        """Apply settings for the current session."""
         config = validate(config)
         with self.lock:
             self.disconnect()
-            self._persist(config, self.presets, self.active_preset)
             self.config = config
             self.previous.clear()
-            self.log('INFO', 'Configuration saved; reconnect to apply')
+            self.log('INFO', 'Applied camera settings for this session')
 
-    def _persist(self, config, presets, active):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.path.with_suffix('.tmp')
-        temp.write_text(json.dumps({'version': 1, 'config': config, 'presets': presets,
-                                    'active_preset': active}, indent=2))
-        temp.replace(self.path)
+    def _restore_presets(self):
+        for path in sorted(self.config_dir.glob('*.json')):
+            try:
+                preset_path(self.config_dir, path.stem)
+                if path.is_file() and not path.is_symlink():
+                    self.presets[path.stem] = read_preset(path)
+            except (OSError, ValueError):
+                continue
+
+        active = None
+        try:
+            active = json.loads(self._selection_path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            active = self._migrate_embedded_presets()
+        except (OSError, ValueError):
+            self.log('WARN', 'Could not read the previous preset selection')
+        if not isinstance(active, str) or active not in self.presets:
+            active = next(iter(self.presets), None)
+        if active is not None:
+            self.active_preset = active
+            self.config = copy.deepcopy(self.presets[active])
+
+    def _migrate_embedded_presets(self):
+        # Older installations can have an aggregate settings file in this directory.
+        if self.path.stem in self.presets or not self.path.is_file() or self.path.is_symlink():
+            return None
+        try:
+            saved = json.loads(self.path.read_text(encoding='utf-8'))
+            if not isinstance(saved, dict) or 'config' not in saved:
+                return None
+            embedded = saved.get('presets') or {}
+            if not isinstance(embedded, dict):
+                return None
+            if not embedded and not self.presets:
+                embedded = {'Custom setup': saved['config']}
+            active = saved.get('active_preset')
+            for name, raw_config in embedded.items():
+                if name in self.presets:
+                    continue
+                try:
+                    self._store_preset(name, validate(raw_config))
+                except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError) as exc:
+                    self.log('WARN', f'Could not migrate preset {name!r}: {exc}')
+            self._remember_preset(active)
+            return active
+        except (OSError, ValueError, RecursionError) as exc:
+            self.log('WARN', f'Could not migrate older presets: {exc}')
+            return None
+
+    def _remember_preset(self, name):
+        write_json(self._selection_path, name)
+
+    def _store_preset(self, name, config, *, replace=False):
+        path = preset_path(self.config_dir, name)
+        existing = None
+        if path.is_symlink():
+            raise ValueError(f'Cannot use {path.name!r} because it is a symbolic link')
+        if path.exists():
+            try:
+                existing = read_preset(path) if path.is_file() else None
+            except (OSError, ValueError):
+                existing = None
+            if existing is None:
+                raise ValueError(f'Choose another preset name. {path.name!r} is already in use.')
+        if existing is not None and existing != config and not replace:
+            raise ValueError(f'A different preset named {name!r} already exists. Rename the file and try again.')
+        write_json(path, config)
+        self.presets[name] = copy.deepcopy(config)
 
     def save_preset(self, name, config):
-        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80 or any(ord(c) < 32 for c in name):
+        if not isinstance(name, str):
             raise ValueError('Enter a preset name (1–80 characters)')
-        name, config = name.strip(), validate(config)
+        name, config = name.strip(' '), validate(config)
         with self.lock:
-            presets = copy.deepcopy(self.presets)
-            presets[name] = copy.deepcopy(config)
-            self._persist(config, presets, name)
+            self._store_preset(name, config, replace=True)
+            self._remember_preset(name)
             if config != self.config:
                 self.disconnect()
                 self.cancel_capture()
-            self.config, self.presets, self.active_preset = config, presets, name
+            self.config, self.active_preset = config, name
             self.log('INFO', f'Saved application preset: {name}')
+
+    def import_preset(self, name, config):
+        try:
+            config = validate(config)
+        except (KeyError, TypeError, OverflowError, RecursionError) as exc:
+            raise ValueError('The file must contain a complete camera preset') from exc
+        with self.lock:
+            self._store_preset(name, config)
+            self.load_preset(name)
 
     def load_preset(self, name):
         with self.lock:
             if name not in self.presets:
                 raise ValueError('Preset does not exist')
             config = copy.deepcopy(self.presets[name])
-            self._persist(config, self.presets, name)
+            self._remember_preset(name)
             self.disconnect()
             self.cancel_capture()
             self.config, self.active_preset = config, name
+            self.profile_generation += 1
             self.previous.clear()
             self.input = {'axes': [], 'pressed': []}
             self.virtual = {'axes': [0]*8, 'pressed': []}
             self.log('INFO', f'Loaded application preset: {name}')
 
+    def switch_profile(self, name):
+        """Stop the old camera, load a saved setup, and attempt to enable it."""
+        with self.lock:
+            if name not in self.presets:
+                raise ValueError(f'Application profile does not exist: {name}')
+            held = set(self.input['pressed'])
+            self.load_preset(name)
+            # A held switch button must be released before the destination's
+            # reciprocal mapping can fire, including mappings on other buttons.
+            self.previous = held
+            self.log('ACTION', f'Connecting application profile: {name}')
+            try:
+                self.connect()
+                self.arm()
+            except Exception as exc:
+                self.disconnect()
+                raise ValueError(f'Could not connect application profile {name}: {exc}') from exc
+
+    def export_preset(self, name):
+        with self.lock:
+            if not isinstance(name, str) or name not in self.presets:
+                raise ValueError('Select a saved preset to export')
+            return {'filename': preset_path(self.config_dir, name).name,
+                    'config': copy.deepcopy(self.presets[name])}
+
     def delete_preset(self, name):
         with self.lock:
             if name not in self.presets:
                 raise ValueError('Preset does not exist')
-            presets = copy.deepcopy(self.presets)
-            del presets[name]
-            active = None if name == self.active_preset else self.active_preset
-            self._persist(self.config, presets, active)
-            self.presets, self.active_preset = presets, active
+            preset_path(self.config_dir, name).unlink(missing_ok=True)
+            del self.presets[name]
+            if name == self.active_preset:
+                self.active_preset = None
+                self._remember_preset(None)
             self.log('INFO', f'Deleted application preset: {name}')
 
     def arm(self):
@@ -208,6 +313,7 @@ class Engine:
 
     def preset_state(self):
         return {'active_preset': self.active_preset,
+                'profile_generation': self.profile_generation,
                 'preset_modified': bool(self.active_preset and self.presets.get(self.active_preset) != self.config)}
 
     def test_connection(self, camera):
@@ -264,7 +370,7 @@ class Engine:
             self.input = {'axes': [], 'pressed': []}
             self.previous.clear()
             self.cancel_capture()
-            self.log('INFO', 'Controller selected; input monitor is live. Save as preset to remember it.')
+            self.log('INFO', 'Controller selected. Input monitor is live. Use Save Preset to remember it.')
 
     def execute(self, action, param=0):
         with self.lock:
@@ -272,6 +378,9 @@ class Engine:
                 self.stop()
                 return
             if action == 'none':
+                return
+            if action == 'profile_connect':
+                self.switch_profile(param)
                 return
             data = command(action, param, self.config['camera']['address'])
             self.send(data)
@@ -311,7 +420,7 @@ class Engine:
             motion = dict.fromkeys(self.motion, 0.)
             for axis in self.config['axes']:
                 value = axes[axis['index']] if axis['index'] < len(axes) else 0
-                motion[axis['target']] = deadzone(value, axis['deadzone']) * (-1 if axis['invert'] else 1)
+                motion[axis['target']] = analog_response(value, axis['deadzone'], axis.get('response', 3)) * (-1 if axis['invert'] else 1)
             for binding in self.config['bindings']:
                 if binding['source'] not in pressed:
                     continue
@@ -324,9 +433,15 @@ class Engine:
                     target = 'pan' if target == 'pan' else 'tilt' if target == 'tilt' else target
                     motion[target] = -1 if direction in ('left', 'up', 'out', 'near') else 1
                 elif binding['source'] not in self.previous:
+                    profile_generation = self.profile_generation
                     self.execute(action, binding.get('param', 0))
+                    if self.profile_generation != profile_generation:
+                        # Remaining bindings and analog samples belong to the old setup.
+                        return
             self.previous = set(pressed)
-            motion = {k: round(v*self.config['speed'], 2) for k, v in motion.items()}
+            # Keep small nonzero inputs: rounding here would enlarge the deadzone
+            # after the curve. VISCA packet encoding handles speed quantization.
+            motion = {k: v*self.config['speed'] for k, v in motion.items()}
             current = tuple(motion.values())
             old = dict(zip(motion, self.last_motion)) if self.last_motion else dict.fromkeys(motion, 0.)
             releasing = any(old[k] and not motion[k] for k in motion)
@@ -335,10 +450,10 @@ class Engine:
             if current != self.last_motion and (releasing or self.last_motion is None or
                                                 self.sample_time-self.last_command_time >= 1/30):
                 address = self.config['camera']['address']
-                if self.last_motion is None or (motion['pan'], motion['tilt']) != (old['pan'], old['tilt']):
+                if self.last_motion is None or pantilt(motion['pan'], motion['tilt'], address) != pantilt(old['pan'], old['tilt'], address):
                     self.send(pantilt(motion['pan'], motion['tilt'], address))
                 for kind in ('zoom', 'focus'):
-                    if self.last_motion is None or motion[kind] != old[kind]:
+                    if self.last_motion is None or lens(kind, motion[kind], address) != lens(kind, old[kind], address):
                         self.send(lens(kind, motion[kind], address))
                 self.last_motion = current
                 self.last_command_time = self.sample_time
@@ -425,7 +540,8 @@ class Engine:
                             self.transport.drain_logs()
                         if self.armed and self.transport and self.transport.error:
                             self.stop()
-                        if self.armed and time.monotonic()-self.heartbeat > 1.5:
+                        needs_heartbeat = not self.native_window or self.config['controller'] == 'virtual'
+                        if self.armed and needs_heartbeat and time.monotonic()-self.heartbeat > 1.5:
                             self.stop()
                             self.log('INFO', 'GUI heartbeat lost; controls disarmed')
                         selected = self.config['controller']

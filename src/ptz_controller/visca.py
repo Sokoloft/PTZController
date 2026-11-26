@@ -1,6 +1,6 @@
 """Command validation and raw/TCP compatibility transport.
 
-Sony UDP camera control uses visca_over_ip through package_camera.py.
+UDP camera control uses the serialized worker in package_camera.py.
 """
 import socket
 import struct
@@ -9,7 +9,8 @@ import time
 
 
 ACTIONS = {
-    'none': 'Unmapped', 'stop': 'Stop all motion', 'home': 'Pan/tilt home',
+    'none': 'Unmapped', 'stop': 'Stop all motion',
+    'profile_connect': 'Load and connect application profile', 'home': 'Pan/tilt home',
     'pan_left': 'Pan left', 'pan_right': 'Pan right', 'tilt_up': 'Tilt up',
     'tilt_down': 'Tilt down', 'zoom_in': 'Zoom in', 'zoom_out': 'Zoom out',
     'focus_near': 'Focus near', 'focus_far': 'Focus far',
@@ -172,7 +173,7 @@ class Transport:
 
 
 def open_transport(settings, log):
-    if settings['mode'] == 'udp' and settings['framing'] == 'sony':
+    if settings['mode'] == 'udp':
         from .package_camera import PackageTransport
         return PackageTransport(settings, log)
     return Transport(settings, log)

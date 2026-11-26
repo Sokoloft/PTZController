@@ -69,7 +69,8 @@ meter::-webkit-meter-bar, meter::-webkit-meter-optimum-value { transition: none;
 .section-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 18px; }
 .section-heading h2 { margin: 0; }
 .badge { font-size: 13px; border: 1px solid #626262; border-radius: 20px; padding: 6px 12px; color: #cccccc; }
-.preset-save { max-width: 620px; }
+.preset-save { max-width: 760px; }
+#save { display: inline-flex; align-items: center; gap: 7px; }
 .preset-list { display: grid; grid-template-columns: repeat(auto-fit,minmax(260px,1fr)); gap: 10px; }
 .preset-card { display: flex; gap: 8px; align-items: center; padding: 8px; border: 1px solid #505050; border-radius: 7px; }
 .preset-card.selected { border-color: #aaaaaa; background: #383838; }

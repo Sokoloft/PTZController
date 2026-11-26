@@ -25,6 +25,10 @@ def create_app(engine):
         engine.log('ERROR', str(exc))
         return jsonify(error=str(exc)), 400
 
+    @app.errorhandler(413)
+    def request_too_large(_exc):
+        return jsonify(error='The request exceeds the 128 KB limit'), 413
+
     @app.get('/')
     def index():
         return render_template('index.html', token=token)
@@ -84,6 +88,11 @@ def create_app(engine):
             elif operation == 'preset-load':
                 engine.load_preset(data['name'])
                 result['state'] = engine.snapshot()
+            elif operation == 'preset-import':
+                engine.import_preset(data['name'], data['config'])
+                result['state'] = engine.snapshot()
+            elif operation == 'preset-export':
+                result.update(engine.export_preset(data['name']))
             elif operation == 'preset-delete':
                 engine.delete_preset(data['name'])
                 result['state'] = engine.snapshot()

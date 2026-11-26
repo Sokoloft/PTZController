@@ -14,8 +14,8 @@ curl -fsSL https://github.com/Sokoloft/PTZController/releases/latest/download/in
 
 It downloads the latest architecture-matched release into `~/.local/bin`, installs
 the gamepad icon and application-menu launcher, and preserves existing settings.
-The desktop launcher passes `--config ~/.config/ptz-controller/config.json` using
-the user's absolute path (or XDG_CONFIG_HOME when set). No root access, pip or git
+The desktop launcher uses the user's preset directory under `~/.config` or
+`$XDG_CONFIG_HOME`. No root access, pip or git
 is needed for this installation. Publish `install.sh` as a release asset alongside
 a matching `PTZ_Controller-x86_64.AppImage` or
 `PTZ_Controller-aarch64.AppImage` on
@@ -38,7 +38,7 @@ Print the application version without starting the GUI/server:
 python src/main.py --version
 ```
 
-The initial application version is 1.0.0, defined in `ptz_controller.__version__`. See
+The application version is 1.0.1, defined in `ptz_controller.__version__`. See
 [PACKAGING.md](docs/PACKAGING.md) for the standalone AppImage release workflow
 and persistent-configuration behavior.
 
@@ -84,29 +84,32 @@ and the same control engine. Only the desktop window is omitted.
 For a real controller, select it in Controller: selection immediately switches the
 live input monitor, even without a camera connection or arming. Move the sticks and
 watch the axis meters; press buttons and watch the Pressed list. Edit mappings,
-click Connect to apply the displayed setup and enable motion. Connect saves displayed settings
-automatically. Buttons start unmapped; add mappings for the buttons you want to use.
+click Connect to apply the displayed setup and enable motion. Use Save Preset to
+keep those settings. Buttons start unmapped, so add mappings for the buttons you want to use.
 You can use a real controller with Virtual camera to test without any camera.
 
-Selecting a controller disarms motion without disconnecting the camera. Save as preset
-to remember a named setup, or click Connect to apply and remember the current setup. Controller IDs
+Selecting a controller disarms motion without disconnecting the camera. Use Save Preset
+to remember a named setup. Connect applies the current setup for this session. Controller IDs
 use SDL GUIDs instead of temporary instance IDs. Identical controllers use an ordinal;
 if their connection order changes, reselect the desired one. Older instance-ID based
 configurations are still readable, but reselect and save to migrate to a stable ID.
-The current setup and named presets default to `config.json` next to `src/main.py`
-when running from source, or next to the AppImage/executable when packaged. The
-location does not depend on the working directory. Override it with
-`--config /path/to/config.json`; the installed desktop launcher uses the user's
-`.config/ptz-controller/config.json` instead. There is no environment override.
-Keep an app-local config directory writable. Existing
-settings from `~/.config/ptz-controller/config.json` are copied automatically on
-first launch if no local `config.json` exists; the original file is preserved.
+The app discovers preset JSON files in `~/.config/ptz-controller` or
+`$XDG_CONFIG_HOME/ptz-controller` when set. The desktop launcher can supply
+`--config /path/to/config.json` to use the directory containing that path.
+Every preset has its own `<preset name>.json` file, including its per-axis deadzones.
+The app opens the last selected preset or the first available preset at startup.
 
 ## Application presets and mapping capture
 
 Camera Presets below Camera Connection stores complete application setups, separate
-from the camera's own position-memory slots. Enter a name and click Save as preset.
-Saving an existing name updates it. When disconnected, selecting a preset only loads
+from the camera's own position-memory slots. Enter a name and click **Save Preset**.
+The preset name field starts with the active name, so saving updates that preset.
+Use **Import Preset** to choose a JSON file. The app activates it and copies it
+into the config directory using the file's name. If a different preset already has
+that name, rename the file before importing it. **Export Preset** opens a Save dialog
+with the active saved preset's name. Browser mode uses the browser's file picker
+when supported and its download settings otherwise. Select a saved preset card to switch
+between local presets. When disconnected, selecting a preset only loads
 its settings; use Connect to enable it. When connected, selecting a preset stops the
 old camera and reconnects with the new settings automatically. Unconfirmed or failed
 connections do not trigger automatic reconnection on preset selection. Connect and Disconnect
@@ -118,16 +121,29 @@ toggle the connection off. If controls were automatically disarmed, Connect enab
 them again. The active preset name appears beside the header status, with edits
 marked modified. The interface uses neutral grays, retaining connection-status and
 controller-button colors for recognition.
-Named presets and the active setup survive restarts; existing configuration files
-are migrated automatically. Starting the application does not connect or arm.
+To switch cameras with a controller button, add a mapping with **Load and connect
+application profile** and select the destination saved profile. Save the mapping
+in the current application preset. In the destination preset, map the same button
+back to the original preset and save it. Each press stops/disconnects the old camera,
+loads the destination's complete setup, attempts a connection, and enables controls.
+Release the button before switching back; holding it does not repeatedly switch.
+The switching input sample is not sent as movement to the new camera. A connection
+failure leaves the destination selected and controls disarmed; see Activity Log.
+For UDP, the connection remains awaiting a camera reply until the camera responds.
+The GUI updates to the loaded profile, replacing any unsaved edits.
+
+Named presets and the active preset selection survive restarts. The app migrates
+valid named presets from an older aggregate config file in the user config
+directory and preserves the original file.
+Starting the application does not connect or arm.
 
 Expand Settings for Controller & Motion, Button & D-Pad Mappings, Camera Commands,
 and Camera-free Test Bench. Add mapping starts listening: press the intended
 controller button or D-pad direction to populate its input source. Held buttons
 must be released first. Click an input box or Listen to capture again; Cancel
 listening exits capture. Capturing disarms controls and cannot execute a mapping.
-Each input may be assigned only once. Click Connect to apply mappings or Save as
-preset to store them under a name.
+Each input may be assigned only once. Click Connect to apply mappings or **Save
+Preset** to store them under a name.
 
 Recognized Xbox and Sony controllers show styled button icons in mappings and the
 live pressed-button display: face buttons, bumpers, menu/select, home, D-pad
@@ -169,17 +185,16 @@ Tests use a separate short-lived socket and do not reset camera sequences, clear
 the interface or send motion commands. Successful testing verifies VISCA
 communication, rather than support for every camera command.
 
-- Sony-framed UDP uses the installed `visca-over-ip==0.5.1` package, including its
-  `Camera.pantilt`, `zoom`, `manual_focus`, preset and other public methods. The
-  package handles network framing, sequence numbers and responses. Sony normally
-  uses UDP port 52381 and camera address 1. It resets the sequence at connection.
-  After connecting, Reset Sony sequence
-  sends the sequence reset control packet and disarms controls. Check its reply
-  before using Connect to resume; do not reset a camera controlled by another application.
-- TCP and raw UDP retain the compatibility transport because `visca_over_ip` supports
-  Sony UDP only. Raw VISCA sends only address, command and FF terminator. Ports vary by
-  manufacturer. TCP connection success and UDP socket creation do not prove
-  camera compatibility: status reports whether a reply has been received.
+- Sony-framed and raw UDP use a serialized worker with a bounded command queue.
+  Validated packets are sent unchanged, with at least 50 ms between commands and
+  a bounded wait for ACK/error replies. Pending motion updates are coalesced.
+  Sony normally uses port 52381 and address 1; its sequence resets on connection.
+  Raw VISCA uses address, command and FF terminator; ports vary by manufacturer.
+- TCP uses the compatibility transport. Socket creation does not prove camera
+  compatibility: status reports whether a camera reply has been received.
+- A command rejection logs the transmitted packet and decoded error without
+  disabling the connection. Unsupported commands still require camera-specific
+  settings. Use Raw framing for cameras that do not support Sony IP headers.
 
 The built-in catalog covers movement, zoom/focus, autofocus/manual focus, home,
 power/standby, presets, exposure, white balance, iris, gain, shutter and backlight.
@@ -196,18 +211,25 @@ The GUI settings file stores mappings, not camera preset contents.
 
 Motion buttons run while held; other mappings run once per press. Each target has
 one analog axis; held motion buttons override that target. Speed caps motion.
-Stop disarms. Disconnect, controller loss, window blur, and lost GUI heartbeat also
-stop/disarm. A broken network cannot guarantee delivery of a stop packet.
-Use the controller only with the GUI focused. Sliders latch until centered.
+Analog axes default to Precision response: after the deadzone, a cubic curve keeps
+light stick movements slow while preserving full speed at full travel. Each axis
+can also use Gentle (squared) or Linear response. Existing saved axes default to
+Precision. Inversion and the maximum speed setting still apply. Camera speed steps
+limit the slowest available movement; the curve does not automatically track zoom.
+Stop disarms. Disconnect, controller loss, and desktop app shutdown also stop motion.
+Physical controllers keep working when the desktop window loses focus or is
+minimized. Window blur centers on-screen sliders and releases virtual buttons
+without disarming the physical controller. Sliders otherwise latch until centered.
+Virtual controls and `--browser` mode still disarm on lost GUI heartbeat; browser
+background throttling may trigger that watchdog. Desktop physical input does not
+depend on GUI timer heartbeats. Closing/reloading the GUI page requests Stop.
+A broken network cannot guarantee delivery of a stop packet.
 
-Package calls run on a dedicated worker so camera timeouts do not block controller
-polling or GUI heartbeats. Pending motion updates are coalesced; Stop discards queued
-actions and sends stops after the in-flight operation. Package logs show VISCA
-payloads (marked `visca_over_ip`), responses consumed by the package and timeouts.
-The package's generic command and response hooks are private, so its version is
-pinned; public methods handle named operations wherever available. The adapter
-uses one attempt per command after startup to avoid retrying non-idempotent actions;
-some package methods, such as power, issue repeated commands internally.
+UDP operations run on a dedicated worker so camera timeouts do not block controller
+polling or GUI heartbeats. Stop discards queued actions and sends stops after the
+in-flight operation. Logs include wire packets, replies, errors and timeouts.
+Commands are not automatically retried, avoiding duplicate preset/power actions.
+Joystick changes that encode to the same VISCA speed do not send duplicate packets.
 
 The compatibility transport logs raw packet traffic and replies asynchronously.
 Reply logging and socket creation are not proof that an operation completed.
@@ -223,7 +245,7 @@ node tests/test_live.cjs
 
 Tests cover packet bytes, deadzones, input edges/release, preset simulation,
 configuration/API validation, controller selection and stable IDs, command queue
-stop behavior, the real package against a localhost UDP camera, and compatibility
+stop behavior, the queued transport against a localhost UDP camera, and compatibility
 TCP/UDP mock-camera traffic. No camera,
 controller, desktop session or Qt is needed for the tests.
 
@@ -243,5 +265,5 @@ QT_QPA_PLATFORM=offscreen QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu python tests/
 - [visca_over_ip package](https://pypi.org/project/visca-over-ip/0.5.1/)
 
 Flask, pywebview and pygame-ce provide the GUI, HTTP server and controller input.
-Sony UDP camera control uses visca_over_ip. The validated command catalog and
-simulator are shared with the raw/TCP compatibility transport.
+UDP camera control uses the built-in queued transport. The validated command
+catalog and simulator are shared with the TCP compatibility transport.

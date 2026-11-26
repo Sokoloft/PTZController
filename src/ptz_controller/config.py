@@ -1,21 +1,34 @@
-"""Locate writable user settings beside the source app or distributed executable."""
+"""Locate and write user settings in the user's config directory."""
+import json
 import os
 from pathlib import Path
-import sys
+from tempfile import NamedTemporaryFile
 
 
 def default_config_path():
-    if getattr(sys, 'frozen', False):
-        # APPIMAGE points outside the read-only mount; sys.executable points inside it.
-        executable = Path(sys.executable).resolve()
-        image, mount = os.environ.get('APPIMAGE'), os.environ.get('APPDIR')
-        # A standalone frozen app can also inherit an IDE's AppImage environment.
-        if image and (not mount or executable.is_relative_to(Path(mount).resolve())):
-            executable = Path(image).resolve()
-        return executable.parent/'config.json'
-    # An IDE itself may be an AppImage: ignore inherited APPIMAGE in source runs.
-    return Path(__file__).resolve().parents[1]/'config.json'
+    base = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home()/'.config')
+    if not base.is_absolute():
+        base = Path.home()/'.config'
+    return base/'ptz-controller'/'config.json'
 
 
-def legacy_config_path():
-    return Path.home()/'.config/ptz-controller/config.json'
+def preset_path(directory, name):
+    if (not isinstance(name, str) or not 1 <= len(name) <= 80 or
+            name != name.strip() or name in ('.', '..') or
+            any(c in '/\\' or ord(c) < 32 or ord(c) == 127 for c in name) or
+            len(name.encode('utf-8')) > 250):
+        raise ValueError('Use a preset name of 1–80 characters without path separators or control characters')
+    return directory/f'{name}.json'
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                            suffix='.tmp', delete=False) as stream:
+        temp = Path(stream.name)
+        try:
+            json.dump(data, stream, indent=2)
+            stream.close()
+            temp.replace(path)
+        finally:
+            temp.unlink(missing_ok=True)

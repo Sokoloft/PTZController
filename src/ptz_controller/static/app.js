@@ -2,7 +2,7 @@ const $ = id => document.getElementById(id);
 let state, config, axes = Array(8).fill(0), pressed = new Set(), polling = false;
 const timeline=new PTZLive.Timeline();
 let meterNodes=[], lastModelText=0;
-let runtime={}, dirty=false, connecting=false, presetSignature='';
+let runtime={}, dirty=false, connecting=false, presetSignature='', appliedProfileGeneration=0;
 let captureBinding=null, captureId=null, captureToken=0;
 let badgeNodes=[], buttonSignature='', pressedSignature='';
 const deviceCache=new Map();
@@ -64,7 +64,7 @@ function renderMappings() {
     const dz = input(a.deadzone, 'number', v => a.deadzone = v); Object.assign(dz, {min:0, max:.95, step:.01});
     const invert = element('input', {type:'checkbox', checked:a.invert}); invert.onchange = () => {a.invert = invert.checked;markDirty();};
     const remove = element('button', {textContent:'Remove'}); remove.onclick = () => { config.axes.splice(index,1);markDirty();renderMappings(); };
-    row.append(field('Axis index', input(a.index, 'number', v => a.index = v)), field('Motion', select({pan:'Pan',tilt:'Tilt',zoom:'Zoom',focus:'Focus'}, a.target, v => a.target = v)), field('Deadzone (0–0.95)', dz), field('Invert', invert), remove);
+    row.append(field('Axis index', input(a.index, 'number', v => a.index = v)), field('Motion', select({pan:'Pan',tilt:'Tilt',zoom:'Zoom',focus:'Focus'}, a.target, v => a.target = v)), field('Deadzone (0–0.95)', dz), field('Stick response', select({1:'Linear',2:'Gentle',3:'Precision'}, a.response ?? 3, v => a.response = Number(v))), field('Invert', invert), remove);
     $('axes').append(row);
   });
   $('bindings').replaceChildren();
@@ -79,7 +79,23 @@ function renderMappings() {
     const learn=element('button',{textContent:captureBinding===b?'Listening…':'Listen'});
     learn.onclick=run(()=>startLearning(b));
     const remove = element('button', {textContent:'Remove'}); remove.onclick = () => { if(captureBinding===b)cancelLearning();config.bindings.splice(index,1);markDirty();renderMappings(); };
-    row.append(field('Input source',group),learn, field('Command',select(state.actions,b.action,v=>b.action=v)), field('Memory slot / hex',input(b.param ?? 0,'text',v=>b.param=v)),remove);
+    const parameter=element('div');
+    function renderParameter() {
+      if(b.action==='profile_connect') {
+        const choices=new Map([['','Select saved profile…'],...(state.presets || []).map(p=>[p.name,p.name])]);
+        if(b.param && !choices.has(String(b.param)))choices.set(String(b.param),String(b.param)+' (missing)');
+        const target=element('select');
+        for(const [value,label] of choices)target.add(new Option(label,value));
+        target.value=b.param || '';target.onchange=()=>{b.param=target.value;markDirty();};
+        parameter.replaceChildren(field('Application profile',target));
+      } else parameter.replaceChildren(field('Memory slot / hex',input(b.param ?? 0,'text',v=>b.param=v)));
+      globalThis.PTZDropdowns?.refresh();
+    }
+    const action=select(state.actions,b.action,v=>{
+      b.action=v;b.param=v==='profile_connect'?'':0;renderParameter();
+    });
+    renderParameter();
+    row.append(field('Input source',group),learn,field('Command',action),parameter,remove);
     $('bindings').append(row);
   });
   refreshButtonBadges();
@@ -101,7 +117,7 @@ function devices() {
 }
 function initialize() {
   applyConfig(state);
-  $('command').replaceChildren(...Object.entries(state.actions).filter(([v])=>!['none','pan_left','pan_right','tilt_up','tilt_down','zoom_in','zoom_out','focus_near','focus_far'].includes(v)).map(([v,t])=>new Option(t,v)));
+  $('command').replaceChildren(...Object.entries(state.actions).filter(([v])=>!['none','pan_left','pan_right','tilt_up','tilt_down','zoom_in','zoom_out','focus_near','focus_far','profile_connect'].includes(v)).map(([v,t])=>new Option(t,v)));
   for(let index=0;index<8;index++) {
     const range = element('input',{type:'range', min:-1, max:1, step:.01, value:0});
     range.oninput=()=> { axes[index]=Number(range.value); pushVirtual(); };
@@ -113,6 +129,7 @@ function initialize() {
 }
 function applyConfig(next) {
   state=next;runtime={...runtime,...next};config=structuredClone(next.config);dirty=false;
+  appliedProfileGeneration=next.profile_generation ?? 0;
   for (const key of ['mode','host','port','framing','address']) $(key).value=config.camera[key];
   $('speed').value=config.speed; $('speedValue').textContent=Math.round(config.speed*100)+'%';
   $('controller').replaceChildren(new Option('Virtual controller','virtual'));
@@ -176,7 +193,12 @@ $('testConnection').onclick=async()=>{
 };
 async function refreshState() {
   const response=await fetch('/api/state');if(!response.ok)throw Error('Status unavailable');
-  state=await response.json();runtime={...runtime,...state};return state;
+  state=await response.json();runtime={...runtime,...state};
+  if(config && appliedProfileGeneration!==(state.profile_generation ?? 0)) {
+    await cancelLearning();applyConfig(state);center();
+    notice('Loaded application profile: '+state.active_preset);
+  }
+  return state;
 }
 async function connectSetup() {
   if(connecting)return;
@@ -192,29 +214,115 @@ async function connectSetup() {
 }
 $('connect').onclick=run(connectSetup);
 $('save').onclick=run(async()=>{
+  if(connecting)return;
   await cancelLearning();
   const result=await api('preset-save',{name:$('presetName').value,config:collectConfig()});
-  applyConfig(result.state);notice('Preset saved: '+result.state.active_preset);
+  applyConfig(result.state);renderStatus(result.state);notice('Preset saved: '+result.state.active_preset);
 });
-async function usePreset(name) {
+const presetFileTypes=[{description:'JSON preset',accept:{'application/json':['.json']}}];
+let choosingImport=false, exportingPreset=false;
+$('importPreset').onclick=run(async()=>{
+  if(connecting || choosingImport || exportingPreset)return;
+  const desktop=window.pywebview?.api;
+  if(!desktop?.choose_preset && !window.showOpenFilePicker) {
+    $('presetFile').click();
+    return;
+  }
+  choosingImport=true;
+  renderPresets();
+  try {
+    if(desktop?.choose_preset) {
+      const result=await desktop.choose_preset();
+      if(result.error)throw Error(result.error);
+      if(result.name)await importPreset({name:result.name,text:async()=>result.content});
+    } else {
+      const [handle]=await window.showOpenFilePicker({startIn:'home',types:presetFileTypes});
+      if(handle)await importPreset(await handle.getFile());
+    }
+  } catch(e) { if(e.name!=='AbortError')throw e; }
+  finally { choosingImport=false;renderPresets(); }
+});
+$('exportPreset').onclick=run(async()=>{
+  const name=state?.active_preset;
+  if(connecting || choosingImport || exportingPreset || !name)return;
+  exportingPreset=true;
+  renderPresets();
+  try { await exportPreset(name); }
+  finally { exportingPreset=false;renderPresets(); }
+});
+async function exportPreset(name) {
+  const desktop=window.pywebview?.api;
+  if(desktop?.export_preset) {
+    const result=await desktop.export_preset(name);
+    if(result.error)throw Error(result.error);
+    if(result.saved)notice('Preset exported: '+name);
+    return;
+  }
+  let destination;
+  if(window.showSaveFilePicker) {
+    try {
+      destination=await window.showSaveFilePicker({
+        suggestedName:name+'.json',
+        startIn:'home',
+        types:presetFileTypes
+      });
+    } catch(e) {
+      if(e.name==='AbortError')return;
+      throw e;
+    }
+  }
+  const preset=await api('preset-export',{name});
+  const content=JSON.stringify(preset.config,null,2);
+  if(destination) {
+    const writer=await destination.createWritable();
+    await writer.write(content);
+    await writer.close();
+    notice('Preset exported: '+name);
+  } else {
+    const url=URL.createObjectURL(new Blob([content],{type:'application/json'}));
+    element('a',{href:url,download:preset.filename}).click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  }
+}
+$('presetFile').onchange=run(async()=>{
+  const input=$('presetFile'), file=input.files[0];
+  input.value='';
+  if(file)await importPreset(file);
+});
+async function importPreset(file) {
+  if(!/\.json$/i.test(file.name))throw Error('Choose a JSON preset file.');
+  await usePreset(file.name.slice(0,-5),file);
+}
+async function usePreset(name,file) {
   if(connecting)return;
   const reconnect=connectionReady(runtime) && !timeline.sample(performance.now())?.stale;
   connecting=true;
+  renderPresets();
   try {
+    const data={name};
+    if(file) {
+      if(file.size>128*1024)throw Error('The preset file exceeds the 128 KB limit.');
+      try { data.config=JSON.parse(await file.text()); }
+      catch { throw Error('The preset file does not contain valid JSON.'); }
+    }
     await cancelLearning();
-    const result=await api('preset-load',{name});applyConfig(result.state);
+    const result=await api(file?'preset-import':'preset-load',data);applyConfig(result.state);
     center();
     if(reconnect)await api('connect');
     await refreshState();
+    notice('Preset loaded: '+result.state.active_preset);
   } catch(e) { await refreshState();throw e; }
   finally { connecting=false;renderStatus(runtime);renderPresets(); }
 }
 function renderPresets() {
   const presets=state?.presets || [], active=runtime.active_preset;
-  const signature=JSON.stringify([presets,active,runtime.preset_modified,dirty,connecting,runtime.connected,runtime.confirmed,runtime.armed]);
+  const signature=JSON.stringify([presets,active,runtime.preset_modified,dirty,connecting,choosingImport,exportingPreset,runtime.connected,runtime.confirmed,runtime.armed]);
   if(signature===presetSignature)return;presetSignature=signature;
+  $('importPreset').disabled=connecting || choosingImport || exportingPreset;
+  $('exportPreset').disabled=$('importPreset').disabled || !presets.some(p=>p.name===active);
+  $('save').disabled=connecting;
   $('presets').replaceChildren();
-  if(!presets.length)$('presets').append(element('p',{className:'muted',textContent:'No saved presets yet. Name this setup and choose Save as preset.'}));
+  if(!presets.length)$('presets').append(element('p',{className:'muted',textContent:'No saved presets yet.'}));
   for(const p of presets) {
     const card=element('div',{className:'preset-card'+(p.name===active?' selected':'')});
     const load=element('button',{className:'preset-load',disabled:connecting});
@@ -264,7 +372,7 @@ function renderLogs() {
     setText('logs',logs);if(pinned)$('logs').scrollTop=$('logs').scrollHeight;
   }
 }
-/* Config edits stay local until Connect or Save as preset. */
+/* Config edits stay local until Connect or Save Preset. */
 document.addEventListener('input',event=>{
   if(['mode','host','port','framing','address','speed'].includes(event.target.id))markDirty();
   if(['mode','host','port','framing','address'].includes(event.target.id))$('connectionTest').hidden=true;
@@ -280,11 +388,17 @@ $('disconnect').onclick=run(async()=>{await cancelLearning();center();await api(
 $('reset').onclick=run(()=>api('sequence-reset'));
 $('send').onclick=run(()=>api('command',{action:$('command').value,param:$('param').value}));
 $('speed').oninput=()=>$('speedValue').textContent=Math.round(Number($('speed').value)*100)+'%';
-$('addAxis').onclick=()=>{const target=['pan','tilt','zoom','focus'].find(t=>!config.axes.some(a=>a.target===t));if(!target)return notice('All motion targets already have an axis.');config.axes.push({index:0,target,deadzone:.15,invert:false});markDirty();renderMappings();};
+$('addAxis').onclick=()=>{const target=['pan','tilt','zoom','focus'].find(t=>!config.axes.some(a=>a.target===t));if(!target)return notice('All motion targets already have an axis.');config.axes.push({index:0,target,deadzone:.15,response:3,invert:false});markDirty();renderMappings();};
 $('addBinding').onclick=run(async()=>{const binding={source:'',action:'none',param:0};config.bindings.push(binding);markDirty();await startLearning(binding);});
 $('center').onclick=center;
-window.addEventListener('blur',()=>{cancelLearning().catch(()=>{});center();api('stop').catch(()=>{});});
-document.addEventListener('visibilitychange',()=>{if(document.hidden){cancelLearning().catch(()=>{});center();api('stop').catch(()=>{});}});
+// Release on-screen inputs when focus leaves; physical controllers stay armed.
+function releaseWindowInputs() { cancelLearning().catch(()=>{});center(); }
+window.addEventListener('blur',releaseWindowInputs);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)releaseWindowInputs();});
+// Closing/reloading the page is different from switching windows.
+window.addEventListener('pagehide',()=>{
+  fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json','X-PTZ-Token':TOKEN},body:'{}',keepalive:true}).catch(()=>{});
+});
 async function poll() {
   if(polling)return;polling=true;
   try {
@@ -361,7 +475,7 @@ function animate(now) {
 }
 let heartbeatPending=false;
 async function heartbeat() {
-  if(document.hidden || heartbeatPending)return;
+  if(heartbeatPending)return;
   heartbeatPending=true;
   try { await api('heartbeat'); } catch(e) { /* watchdog disarms on lost contact */ }
   finally { heartbeatPending=false; }
